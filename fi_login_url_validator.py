@@ -63,52 +63,103 @@ def _request_get(url, **kwargs):
     return requests.get(url, headers=DEFAULT_HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT, **kwargs)
 
 
+def _response_headers_dict(response):
+    return dict(response.headers.items()) if response is not None else {}
+
+
+def _build_url_variants(url):
+    normalized = _normalize_url(url)
+    if not normalized:
+        return []
+
+    parsed = urlparse(normalized)
+    variants = [normalized]
+    if parsed.path not in {"", "/"}:
+        if normalized.endswith("/"):
+            variants.append(normalized.rstrip("/"))
+        else:
+            variants.append(f"{normalized}/")
+
+    unique_variants = []
+    for variant in variants:
+        if variant and variant not in unique_variants:
+            unique_variants.append(variant)
+    return unique_variants
+
+
 def check_url_reachable(url):
-    url = _normalize_url(url)
-    LOGGER.info("Checking URL reachability", extra={"url": url})
-    if not url:
+    normalized_url = _normalize_url(url)
+    LOGGER.info("Checking URL reachability", extra={"url": normalized_url})
+    if not normalized_url:
         return {"reachable": False, "url": "", "status_code": None, "error": "Empty URL"}
 
     last_error = None
     last_status = None
+    attempt_history = []
+    url_variants = _build_url_variants(normalized_url)
 
     for attempt in range(1, RETRY_COUNT + 1):
-        try:
-            LOGGER.info("URL attempt", extra={"url": url, "attempt": attempt})
-            response = _request_get(url)
-            final_url = response.url or url
-            last_status = response.status_code
-            LOGGER.info(
-                "URL attempt completed",
-                extra={"url": url, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
-            )
-            if response.status_code == 200:
-                return {
-                    "reachable": True,
-                    "url": url,
-                    "final_url": final_url,
-                    "status_code": response.status_code,
-                    "error": None,
-                }
-            last_error = f"Unexpected status code: {response.status_code}"
-        except (requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.TooManyRedirects,
-                requests.exceptions.InvalidURL,
-                requests.exceptions.RequestException) as exc:
-            last_error = str(exc)
-            LOGGER.exception("URL attempt failed", extra={"url": url, "attempt": attempt})
+        for variant in url_variants:
+            try:
+                LOGGER.info("URL attempt", extra={"url": variant, "attempt": attempt})
+                response = _request_get(variant)
+                final_url = response.url or variant
+                last_status = response.status_code
+                response_headers = _response_headers_dict(response)
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "requested_url": variant,
+                        "final_url": final_url,
+                        "status_code": response.status_code,
+                        "headers": response_headers,
+                    }
+                )
+                LOGGER.info(
+                    "URL attempt completed",
+                    extra={"url": variant, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
+                )
+                if response.status_code == 200:
+                    return {
+                        "reachable": True,
+                        "url": normalized_url,
+                        "final_url": final_url,
+                        "status_code": response.status_code,
+                        "headers": response_headers,
+                        "attempts": attempt_history,
+                        "error": None,
+                    }
+                last_error = f"Unexpected status code: {response.status_code}"
+            except (requests.exceptions.SSLError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.TooManyRedirects,
+                    requests.exceptions.InvalidURL,
+                    requests.exceptions.RequestException) as exc:
+                last_error = str(exc)
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "requested_url": variant,
+                        "final_url": None,
+                        "status_code": None,
+                        "headers": {},
+                        "error": str(exc),
+                    }
+                )
+                LOGGER.exception("URL attempt failed", extra={"url": variant, "attempt": attempt})
 
         if attempt < RETRY_COUNT:
-            LOGGER.info("Retrying URL after wait", extra={"url": url, "attempt": attempt, "wait_seconds": RETRY_WAIT_SECONDS})
+            LOGGER.info("Retrying URL after wait", extra={"url": normalized_url, "attempt": attempt, "wait_seconds": RETRY_WAIT_SECONDS})
             time.sleep(RETRY_WAIT_SECONDS)
 
     return {
         "reachable": False,
-        "url": url,
+        "url": normalized_url,
         "final_url": None,
         "status_code": last_status,
+        "headers": {},
+        "attempts": attempt_history,
         "error": last_error,
     }
 
