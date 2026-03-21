@@ -150,53 +150,81 @@ def _extract_browser_error(logs):
     return None
 
 
-def _extract_network_error(performance_logs):
-    http_error_statuses = {404, 500, 502, 503, 504}
-    error_keywords = (
-        "404",
-        "500",
-        "502",
-        "503",
-        "504",
-        "failed",
-        "error",
-        "timeout",
-        "network",
-        "connection refused",
-        "not found",
-        "internal server error",
-    )
+def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
+    active_requests = set()
+    document_request = None
+    network_idle_started_at = None
+    start_time = time.time()
+    logs_seen = []
 
-    for entry in performance_logs:
-        message_text = entry.get("message", "{}")
-        try:
-            message = json.loads(message_text).get("message", {})
-        except json.JSONDecodeError:
-            lowered_message = str(message_text).lower()
-            if any(keyword in lowered_message for keyword in error_keywords):
-                return {"error_code": "NETWORK_LOG_ERROR", "message": message_text}
-            continue
+    while time.time() - start_time < max_wait_seconds:
+        performance_logs = driver.get_log("performance")
+        logs_seen.extend(performance_logs)
 
-        method = message.get("method")
-        params = message.get("params", {})
+        for entry in performance_logs:
+            message_text = entry.get("message", "{}")
+            try:
+                message = json.loads(message_text).get("message", {})
+            except json.JSONDecodeError:
+                continue
 
-        if method == "Network.loadingFailed":
-            error_text = params.get("errorText", "")
-            lowered_error = error_text.lower()
-            if error_text and any(keyword in lowered_error for keyword in error_keywords):
-                return {"error_code": error_text, "message": error_text}
+            method = message.get("method")
+            params = message.get("params", {})
 
-        if method == "Network.responseReceived":
-            response = params.get("response", {})
-            status = response.get("status")
-            if status in http_error_statuses:
-                return {
-                    "error_code": str(status),
-                    "message": response.get("statusText", f"HTTP {status}"),
-                    "status_code": status,
-                }
+            if method == "Network.requestWillBeSent":
+                request_id = params.get("requestId")
+                if request_id:
+                    active_requests.add(request_id)
 
-    return None
+            elif method == "Network.loadingFinished":
+                request_id = params.get("requestId")
+                if request_id:
+                    active_requests.discard(request_id)
+
+            elif method == "Network.loadingFailed":
+                request_id = params.get("requestId")
+                if request_id:
+                    active_requests.discard(request_id)
+                if params.get("type") == "Document":
+                    document_request = {
+                        "url": params.get("documentURL") or driver.current_url,
+                        "status_code": None,
+                        "status_text": params.get("errorText", "Something went wrong"),
+                        "type": "Document",
+                        "error_text": params.get("errorText"),
+                    }
+
+            elif method == "Network.responseReceived":
+                response = params.get("response", {})
+                resource_type = params.get("type")
+                request_id = params.get("requestId")
+                if request_id:
+                    active_requests.discard(request_id)
+                if resource_type == "Document":
+                    document_request = {
+                        "url": response.get("url") or driver.current_url,
+                        "status_code": response.get("status"),
+                        "status_text": response.get("statusText", ""),
+                        "type": resource_type,
+                    }
+
+        ready_state = driver.execute_script("return document.readyState")
+        if not active_requests:
+            if network_idle_started_at is None:
+                network_idle_started_at = time.time()
+            elif time.time() - network_idle_started_at >= 2:
+                LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "no_active_requests"})
+                break
+        else:
+            network_idle_started_at = None
+
+        if ready_state == "complete":
+            LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "document_ready_complete"})
+            break
+
+        time.sleep(0.25)
+
+    return document_request, logs_seen
 
 
 def check_url_reachable(url):
@@ -215,7 +243,6 @@ def check_url_reachable(url):
     last_error_code = None
     last_status = None
     attempt_history = []
-    last_headers = {}
 
     for attempt in range(1, RETRY_COUNT + 1):
         driver = None
@@ -228,95 +255,42 @@ def check_url_reachable(url):
             web_driver_wait(driver, BROWSER_LOAD_WAIT_SECONDS).until(
                 lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
             )
-
+            document_request, performance_logs = _wait_for_network_idle_and_get_document_status(driver, BROWSER_LOAD_WAIT_SECONDS)
             current_url = driver.current_url or normalized_url
-            console_logs = driver.get_log("browser")
-            performance_logs = driver.get_log("performance")
-            browser_error = _extract_browser_error(console_logs)
-            network_error = _extract_network_error(performance_logs)
 
-            LOGGER.info(
-                "Browser logs collected",
-                extra={"url": normalized_url, "attempt": attempt, "console_log_count": len(console_logs), "network_log_count": len(performance_logs)},
-            )
-
-            if browser_error:
-                LOGGER.info("Console errors detected", extra={"url": normalized_url, "attempt": attempt, "error": browser_error})
-                last_error = "Console/network error detected"
-                last_error_code = browser_error.get("error_code")
-                attempt_history.append(
-                    {
-                        "attempt": attempt,
-                        "request_url": normalized_url,
-                        "final_url": current_url,
-                        "status_code": None,
-                        "headers": {},
-                        "reason": "Console/network error detected",
-                        "error_code": browser_error.get("error_code"),
-                        "browser_logs": console_logs,
-                    }
+            if document_request:
+                LOGGER.info(
+                    "Document request captured",
+                    extra={"url": normalized_url, "attempt": attempt, "document_url": document_request.get("url"), "status_code": document_request.get("status_code")},
                 )
-                continue
 
-            if network_error:
-                last_status = network_error.get("status_code")
-                LOGGER.info("Network errors detected", extra={"url": normalized_url, "attempt": attempt, "error": network_error})
-                last_error_code = network_error.get("error_code")
-                attempt_history.append(
-                    {
-                        "attempt": attempt,
-                        "request_url": normalized_url,
-                        "final_url": current_url,
-                        "status_code": last_status,
-                        "headers": {},
-                        "reason": "Console/network error detected",
-                        "error_code": network_error.get("error_code"),
-                        "performance_logs": performance_logs,
-                    }
-                )
-                last_error = "Console/network error detected"
-                continue
-
-            response = requests.get(
-                normalized_url,
-                headers=DEFAULT_HEADERS,
-                allow_redirects=False,
-                timeout=REQUEST_TIMEOUT,
-            )
-            final_url = response.headers.get("Location") or response.url or current_url
-            last_status = response.status_code
-            last_headers = _response_headers_dict(response)
-            reason = _reachability_reason(response.status_code)
+            last_status = document_request.get("status_code") if document_request else None
+            reason = "Something went wrong" if last_status != 200 else "HTTP 200 OK"
             attempt_history.append(
                 {
                     "attempt": attempt,
                     "request_url": normalized_url,
-                    "final_url": final_url,
-                    "status_code": response.status_code,
-                    "headers": last_headers,
+                    "final_url": current_url,
+                    "status_code": last_status,
+                    "headers": {},
                     "reason": reason,
-                    "console_logs": console_logs,
                     "performance_logs": performance_logs,
+                    "document_request": document_request,
                 }
             )
-            LOGGER.info(
-                "URL attempt completed",
-                extra={"url": normalized_url, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
-            )
-            if response.status_code in {200, 301, 302}:
-                LOGGER.info("Final decision", extra={"url": normalized_url, "attempt": attempt, "reachable": True, "status_code": response.status_code})
+
+            LOGGER.info("HTTP status code detected", extra={"url": normalized_url, "attempt": attempt, "status_code": last_status})
+            if last_status == 200:
+                LOGGER.info("Final decision", extra={"url": normalized_url, "attempt": attempt, "reachable": True, "status_code": last_status})
                 return {
-                    "request_url": normalized_url,
-                    "final_url": final_url,
-                    "status_code": response.status_code,
+                    "login_url": normalized_url,
                     "reachable": True,
+                    "http_status_code": 200,
                     "status": "Web page reachable",
-                    "reason": reason,
-                    "headers": last_headers,
                     "attempts": attempt_history,
                 }
-            last_error = reason
-            LOGGER.info("HTTP status codes", extra={"url": normalized_url, "attempt": attempt, "status_code": response.status_code})
+            last_error = document_request.get("status_text") if document_request else "Something went wrong"
+            last_error_code = str(last_status) if last_status is not None else (document_request.get("error_text") if document_request else None)
         except Exception as exc:
             last_error = str(exc)
             error_code = exc.__class__.__name__
@@ -346,16 +320,13 @@ def check_url_reachable(url):
 
     LOGGER.info("Final decision", extra={"url": normalized_url, "reachable": False, "status_code": last_status, "reason": last_error})
     return {
-        "request_url": normalized_url,
-        "final_url": None,
-        "status_code": last_status,
+        "login_url": normalized_url,
         "reachable": False,
+        "http_status_code": last_status,
         "status": "Web page not reachable",
-        "reason": "Console/network error detected" if last_error == "Console/network error detected" else (last_error or (_reachability_reason(last_status) if last_status is not None else "Request failed")),
-        "headers": last_headers,
+        "reason": "Something went wrong",
         "attempts": attempt_history,
         "error_code": last_error_code or (str(last_status) if last_status is not None else None),
-        "login_url": normalized_url,
         "next_step": "STEP 2 — OBTAIN HOME URL",
     }
 
