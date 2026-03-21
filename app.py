@@ -16,6 +16,7 @@ PORT = 8000
 REQUIRED_PACKAGES = {
     "requests": "requests",
     "bs4": "beautifulsoup4",
+    "selenium": "selenium",
 }
 VALIDATOR_FUNCTIONS = {}
 

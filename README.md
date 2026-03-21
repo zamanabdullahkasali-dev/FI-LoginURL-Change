@@ -3,6 +3,7 @@
 ## Setup
 
 It is recommended to create a virtual environment before running the app.
+The reachability check now uses Selenium with headless Chrome, so Chrome and ChromeDriver must also be available on your machine.
 
 ### Windows PowerShell
 
@@ -35,5 +36,5 @@ python -m pip install -r requirements.txt
 If you prefer, you can install them directly:
 
 ```bash
-python -m pip install requests beautifulsoup4
+python -m pip install requests beautifulsoup4 selenium
 ```

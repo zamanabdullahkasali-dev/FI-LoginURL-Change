@@ -1,3 +1,5 @@
+import importlib
+import json
 import logging
 import re
 import time
@@ -12,6 +14,7 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 10
 RETRY_COUNT = 3
 RETRY_WAIT_SECONDS = 5
+BROWSER_LOAD_WAIT_SECONDS = 15
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -87,6 +90,115 @@ def _reachability_reason(status_code):
     return reasons.get(status_code, f"HTTP {status_code}")
 
 
+def _load_selenium_components():
+    webdriver_module = importlib.import_module("selenium.webdriver")
+    options_module = importlib.import_module("selenium.webdriver.chrome.options")
+    service_module = importlib.import_module("selenium.webdriver.chrome.service")
+    support_ui_module = importlib.import_module("selenium.webdriver.support.ui")
+
+    return {
+        "webdriver": webdriver_module,
+        "chrome_options": options_module.Options,
+        "chrome_service": service_module.Service,
+        "web_driver_wait": support_ui_module.WebDriverWait,
+    }
+
+
+def _build_browser_driver():
+    selenium_components = _load_selenium_components()
+    options = selenium_components["chrome_options"]()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1440,900")
+    options.set_capability("goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"})
+
+    service = selenium_components["chrome_service"]()
+    driver = selenium_components["webdriver"].Chrome(service=service, options=options)
+    driver.set_page_load_timeout(BROWSER_LOAD_WAIT_SECONDS)
+    return driver, selenium_components
+
+
+def _extract_browser_error(logs):
+    error_keywords = (
+        "404",
+        "500",
+        "502",
+        "503",
+        "504",
+        "err_connection_failed",
+        "err_timed_out",
+        "err_name_not_resolved",
+        "err_ssl_protocol_error",
+        "err_aborted",
+        "failed",
+        "error",
+        "timeout",
+        "network",
+        "connection refused",
+        "not found",
+        "internal server error",
+    )
+
+    for entry in logs:
+        level = str(entry.get("level", "")).upper()
+        message = str(entry.get("message", ""))
+        lowered_message = message.lower()
+        if level == "SEVERE" or any(keyword in lowered_message for keyword in error_keywords):
+            return {"error_code": level or "BROWSER_LOG_ERROR", "message": message}
+    return None
+
+
+def _extract_network_error(performance_logs):
+    http_error_statuses = {404, 500, 502, 503, 504}
+    error_keywords = (
+        "404",
+        "500",
+        "502",
+        "503",
+        "504",
+        "failed",
+        "error",
+        "timeout",
+        "network",
+        "connection refused",
+        "not found",
+        "internal server error",
+    )
+
+    for entry in performance_logs:
+        message_text = entry.get("message", "{}")
+        try:
+            message = json.loads(message_text).get("message", {})
+        except json.JSONDecodeError:
+            lowered_message = str(message_text).lower()
+            if any(keyword in lowered_message for keyword in error_keywords):
+                return {"error_code": "NETWORK_LOG_ERROR", "message": message_text}
+            continue
+
+        method = message.get("method")
+        params = message.get("params", {})
+
+        if method == "Network.loadingFailed":
+            error_text = params.get("errorText", "")
+            lowered_error = error_text.lower()
+            if error_text and any(keyword in lowered_error for keyword in error_keywords):
+                return {"error_code": error_text, "message": error_text}
+
+        if method == "Network.responseReceived":
+            response = params.get("response", {})
+            status = response.get("status")
+            if status in http_error_statuses:
+                return {
+                    "error_code": str(status),
+                    "message": response.get("statusText", f"HTTP {status}"),
+                    "status_code": status,
+                }
+
+    return None
+
+
 def check_url_reachable(url):
     normalized_url = _normalize_url(url)
     LOGGER.info("Checking URL reachability", extra={"url": normalized_url})
@@ -100,20 +212,78 @@ def check_url_reachable(url):
         }
 
     last_error = None
+    last_error_code = None
     last_status = None
     attempt_history = []
     last_headers = {}
 
     for attempt in range(1, RETRY_COUNT + 1):
+        driver = None
         try:
-            LOGGER.info("URL attempt", extra={"url": normalized_url, "attempt": attempt})
+            LOGGER.info("URL loaded", extra={"url": normalized_url, "attempt": attempt})
+            driver, selenium_components = _build_browser_driver()
+            web_driver_wait = selenium_components["web_driver_wait"]
+
+            driver.get(normalized_url)
+            web_driver_wait(driver, BROWSER_LOAD_WAIT_SECONDS).until(
+                lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
+            )
+
+            current_url = driver.current_url or normalized_url
+            console_logs = driver.get_log("browser")
+            performance_logs = driver.get_log("performance")
+            browser_error = _extract_browser_error(console_logs)
+            network_error = _extract_network_error(performance_logs)
+
+            LOGGER.info(
+                "Browser logs collected",
+                extra={"url": normalized_url, "attempt": attempt, "console_log_count": len(console_logs), "network_log_count": len(performance_logs)},
+            )
+
+            if browser_error:
+                LOGGER.info("Console errors detected", extra={"url": normalized_url, "attempt": attempt, "error": browser_error})
+                last_error = "Console/network error detected"
+                last_error_code = browser_error.get("error_code")
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "request_url": normalized_url,
+                        "final_url": current_url,
+                        "status_code": None,
+                        "headers": {},
+                        "reason": "Console/network error detected",
+                        "error_code": browser_error.get("error_code"),
+                        "browser_logs": console_logs,
+                    }
+                )
+                continue
+
+            if network_error:
+                last_status = network_error.get("status_code")
+                LOGGER.info("Network errors detected", extra={"url": normalized_url, "attempt": attempt, "error": network_error})
+                last_error_code = network_error.get("error_code")
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "request_url": normalized_url,
+                        "final_url": current_url,
+                        "status_code": last_status,
+                        "headers": {},
+                        "reason": "Console/network error detected",
+                        "error_code": network_error.get("error_code"),
+                        "performance_logs": performance_logs,
+                    }
+                )
+                last_error = "Console/network error detected"
+                continue
+
             response = requests.get(
                 normalized_url,
                 headers=DEFAULT_HEADERS,
                 allow_redirects=False,
                 timeout=REQUEST_TIMEOUT,
             )
-            final_url = response.headers.get("Location") or response.url or normalized_url
+            final_url = response.headers.get("Location") or response.url or current_url
             last_status = response.status_code
             last_headers = _response_headers_dict(response)
             reason = _reachability_reason(response.status_code)
@@ -125,6 +295,8 @@ def check_url_reachable(url):
                     "status_code": response.status_code,
                     "headers": last_headers,
                     "reason": reason,
+                    "console_logs": console_logs,
+                    "performance_logs": performance_logs,
                 }
             )
             LOGGER.info(
@@ -132,23 +304,23 @@ def check_url_reachable(url):
                 extra={"url": normalized_url, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
             )
             if response.status_code in {200, 301, 302}:
+                LOGGER.info("Final decision", extra={"url": normalized_url, "attempt": attempt, "reachable": True, "status_code": response.status_code})
                 return {
                     "request_url": normalized_url,
                     "final_url": final_url,
                     "status_code": response.status_code,
                     "reachable": True,
+                    "status": "Web page reachable",
                     "reason": reason,
                     "headers": last_headers,
                     "attempts": attempt_history,
                 }
             last_error = reason
-        except (requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.TooManyRedirects,
-                requests.exceptions.InvalidURL,
-                requests.exceptions.RequestException) as exc:
+            LOGGER.info("HTTP status codes", extra={"url": normalized_url, "attempt": attempt, "status_code": response.status_code})
+        except Exception as exc:
             last_error = str(exc)
+            error_code = exc.__class__.__name__
+            last_error_code = error_code
             attempt_history.append(
                 {
                     "attempt": attempt,
@@ -157,22 +329,33 @@ def check_url_reachable(url):
                     "status_code": None,
                     "headers": {},
                     "reason": str(exc),
+                    "error_code": error_code,
                 }
             )
             LOGGER.exception("URL attempt failed", extra={"url": normalized_url, "attempt": attempt})
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    LOGGER.exception("Failed to close browser", extra={"url": normalized_url, "attempt": attempt})
 
         if attempt < RETRY_COUNT:
             LOGGER.info("Retrying URL after wait", extra={"url": normalized_url, "attempt": attempt, "wait_seconds": RETRY_WAIT_SECONDS})
             time.sleep(RETRY_WAIT_SECONDS)
 
+    LOGGER.info("Final decision", extra={"url": normalized_url, "reachable": False, "status_code": last_status, "reason": last_error})
     return {
         "request_url": normalized_url,
         "final_url": None,
         "status_code": last_status,
         "reachable": False,
-        "reason": last_error or (_reachability_reason(last_status) if last_status is not None else "Request failed"),
+        "status": "Web page not reachable",
+        "reason": "Console/network error detected" if last_error == "Console/network error detected" else (last_error or (_reachability_reason(last_status) if last_status is not None else "Request failed")),
         "headers": last_headers,
         "attempts": attempt_history,
+        "error_code": last_error_code or (str(last_status) if last_status is not None else None),
+        "login_url": normalized_url,
         "next_step": "STEP 2 — OBTAIN HOME URL",
     }
 
