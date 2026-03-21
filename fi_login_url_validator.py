@@ -67,100 +67,113 @@ def _response_headers_dict(response):
     return dict(response.headers.items()) if response is not None else {}
 
 
-def _build_url_variants(url):
-    normalized = _normalize_url(url)
-    if not normalized:
-        return []
-
-    parsed = urlparse(normalized)
-    variants = [normalized]
-    if parsed.path not in {"", "/"}:
-        if normalized.endswith("/"):
-            variants.append(normalized.rstrip("/"))
-        else:
-            variants.append(f"{normalized}/")
-
-    unique_variants = []
-    for variant in variants:
-        if variant and variant not in unique_variants:
-            unique_variants.append(variant)
-    return unique_variants
+def _reachability_reason(status_code):
+    reasons = {
+        200: "HTTP 200 OK",
+        301: "HTTP 301 Moved Permanently",
+        302: "HTTP 302 Found",
+        400: "HTTP 400 Bad Request",
+        401: "HTTP 401 Unauthorized",
+        403: "HTTP 403 Forbidden",
+        404: "HTTP 404 Not Found",
+        405: "HTTP 405 Method Not Allowed",
+        408: "HTTP 408 Request Timeout",
+        429: "HTTP 429 Too Many Requests",
+        500: "HTTP 500 Internal Server Error",
+        502: "HTTP 502 Bad Gateway",
+        503: "HTTP 503 Service Unavailable",
+        504: "HTTP 504 Gateway Timeout",
+    }
+    return reasons.get(status_code, f"HTTP {status_code}")
 
 
 def check_url_reachable(url):
     normalized_url = _normalize_url(url)
     LOGGER.info("Checking URL reachability", extra={"url": normalized_url})
     if not normalized_url:
-        return {"reachable": False, "url": "", "status_code": None, "error": "Empty URL"}
+        return {
+            "request_url": "",
+            "status_code": None,
+            "reachable": False,
+            "reason": "Empty URL",
+            "next_step": "STEP 2 — OBTAIN HOME URL",
+        }
 
     last_error = None
     last_status = None
     attempt_history = []
-    url_variants = _build_url_variants(normalized_url)
+    last_headers = {}
 
     for attempt in range(1, RETRY_COUNT + 1):
-        for variant in url_variants:
-            try:
-                LOGGER.info("URL attempt", extra={"url": variant, "attempt": attempt})
-                response = _request_get(variant)
-                final_url = response.url or variant
-                last_status = response.status_code
-                response_headers = _response_headers_dict(response)
-                attempt_history.append(
-                    {
-                        "attempt": attempt,
-                        "requested_url": variant,
-                        "final_url": final_url,
-                        "status_code": response.status_code,
-                        "headers": response_headers,
-                    }
-                )
-                LOGGER.info(
-                    "URL attempt completed",
-                    extra={"url": variant, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
-                )
-                if response.status_code == 200:
-                    return {
-                        "reachable": True,
-                        "url": normalized_url,
-                        "final_url": final_url,
-                        "status_code": response.status_code,
-                        "headers": response_headers,
-                        "attempts": attempt_history,
-                        "error": None,
-                    }
-                last_error = f"Unexpected status code: {response.status_code}"
-            except (requests.exceptions.SSLError,
-                    requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout,
-                    requests.exceptions.TooManyRedirects,
-                    requests.exceptions.InvalidURL,
-                    requests.exceptions.RequestException) as exc:
-                last_error = str(exc)
-                attempt_history.append(
-                    {
-                        "attempt": attempt,
-                        "requested_url": variant,
-                        "final_url": None,
-                        "status_code": None,
-                        "headers": {},
-                        "error": str(exc),
-                    }
-                )
-                LOGGER.exception("URL attempt failed", extra={"url": variant, "attempt": attempt})
+        try:
+            LOGGER.info("URL attempt", extra={"url": normalized_url, "attempt": attempt})
+            response = requests.get(
+                normalized_url,
+                headers=DEFAULT_HEADERS,
+                allow_redirects=False,
+                timeout=REQUEST_TIMEOUT,
+            )
+            final_url = response.headers.get("Location") or response.url or normalized_url
+            last_status = response.status_code
+            last_headers = _response_headers_dict(response)
+            reason = _reachability_reason(response.status_code)
+            attempt_history.append(
+                {
+                    "attempt": attempt,
+                    "request_url": normalized_url,
+                    "final_url": final_url,
+                    "status_code": response.status_code,
+                    "headers": last_headers,
+                    "reason": reason,
+                }
+            )
+            LOGGER.info(
+                "URL attempt completed",
+                extra={"url": normalized_url, "attempt": attempt, "status_code": response.status_code, "final_url": final_url},
+            )
+            if response.status_code in {200, 301, 302}:
+                return {
+                    "request_url": normalized_url,
+                    "final_url": final_url,
+                    "status_code": response.status_code,
+                    "reachable": True,
+                    "reason": reason,
+                    "headers": last_headers,
+                    "attempts": attempt_history,
+                }
+            last_error = reason
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.TooManyRedirects,
+                requests.exceptions.InvalidURL,
+                requests.exceptions.RequestException) as exc:
+            last_error = str(exc)
+            attempt_history.append(
+                {
+                    "attempt": attempt,
+                    "request_url": normalized_url,
+                    "final_url": None,
+                    "status_code": None,
+                    "headers": {},
+                    "reason": str(exc),
+                }
+            )
+            LOGGER.exception("URL attempt failed", extra={"url": normalized_url, "attempt": attempt})
 
         if attempt < RETRY_COUNT:
             LOGGER.info("Retrying URL after wait", extra={"url": normalized_url, "attempt": attempt, "wait_seconds": RETRY_WAIT_SECONDS})
             time.sleep(RETRY_WAIT_SECONDS)
 
     return {
-        "reachable": False,
-        "url": normalized_url,
+        "request_url": normalized_url,
         "final_url": None,
         "status_code": last_status,
-        "headers": {},
+        "reachable": False,
+        "reason": last_error or (_reachability_reason(last_status) if last_status is not None else "Request failed"),
+        "headers": last_headers,
         "attempts": attempt_history,
-        "error": last_error,
+        "next_step": "STEP 2 — OBTAIN HOME URL",
     }
 
 
@@ -488,6 +501,9 @@ def process_ticket(ticket):
     existing_login_validation = check_url_reachable(stored_login_url)
     if existing_login_validation.get("reachable"):
         return {"result": "Login URL working", "login_url": existing_login_validation.get("final_url") or stored_login_url}
+
+    if existing_login_validation.get("status_code") == 404:
+        LOGGER.info("Login URL returned HTTP 404 — proceeding to Home URL discovery")
 
     home_url = ticket.get("home_url")
     if home_url:
