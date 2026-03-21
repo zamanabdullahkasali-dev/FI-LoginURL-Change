@@ -208,19 +208,14 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                         "type": resource_type,
                     }
 
-        ready_state = driver.execute_script("return document.readyState")
         if not active_requests:
             if network_idle_started_at is None:
                 network_idle_started_at = time.time()
             elif time.time() - network_idle_started_at >= 2:
-                LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "no_active_requests"})
+                LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "no_active_requests_for_2_seconds"})
                 break
         else:
             network_idle_started_at = None
-
-        if ready_state == "complete":
-            LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "document_ready_complete"})
-            break
 
         time.sleep(0.25)
 
@@ -262,6 +257,10 @@ def check_url_reachable(url):
                 LOGGER.info(
                     "Document request captured",
                     extra={"url": normalized_url, "attempt": attempt, "document_url": document_request.get("url"), "status_code": document_request.get("status_code")},
+                )
+                LOGGER.info(
+                    "Doc filter applied",
+                    extra={"url": normalized_url, "attempt": attempt, "resource_type": document_request.get("type")},
                 )
 
             last_status = document_request.get("status_code") if document_request else None
