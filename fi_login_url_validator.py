@@ -120,36 +120,6 @@ def _build_browser_driver():
     return driver, selenium_components
 
 
-def _extract_browser_error(logs):
-    error_keywords = (
-        "404",
-        "500",
-        "502",
-        "503",
-        "504",
-        "err_connection_failed",
-        "err_timed_out",
-        "err_name_not_resolved",
-        "err_ssl_protocol_error",
-        "err_aborted",
-        "failed",
-        "error",
-        "timeout",
-        "network",
-        "connection refused",
-        "not found",
-        "internal server error",
-    )
-
-    for entry in logs:
-        level = str(entry.get("level", "")).upper()
-        message = str(entry.get("message", ""))
-        lowered_message = message.lower()
-        if level == "SEVERE" or any(keyword in lowered_message for keyword in error_keywords):
-            return {"error_code": level or "BROWSER_LOG_ERROR", "message": message}
-    return None
-
-
 def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
     active_requests = set()
     document_request = None
@@ -185,7 +155,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                 request_id = params.get("requestId")
                 if request_id:
                     active_requests.discard(request_id)
-                if params.get("type") == "Document":
+                if params.get("type") == "Document" and document_request is None:
                     document_request = {
                         "url": params.get("documentURL") or driver.current_url,
                         "status_code": None,
@@ -200,7 +170,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                 request_id = params.get("requestId")
                 if request_id:
                     active_requests.discard(request_id)
-                if resource_type == "Document":
+                if resource_type == "Document" and document_request is None:
                     document_request = {
                         "url": response.get("url") or driver.current_url,
                         "status_code": response.get("status"),
