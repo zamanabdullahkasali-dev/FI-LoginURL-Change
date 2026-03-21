@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FI Login URL Validator</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="hero card">
+        <h1>FI Login URL Validator</h1>
+        <p>
+          Enter a ticket once, then run the individual validator functions or the
+          full <code>process_ticket</code> workflow from the browser.
+        </p>
+      </section>
+
+      <section class="card grid two-columns">
+        <div>
+          <h2>Ticket Input</h2>
+          <label>FI Name
+            <input id="fi_name" placeholder="Example Bank - Personal" />
+          </label>
+          <label>Stored Login URL
+            <input id="login_url" placeholder="https://example.com/login" />
+          </label>
+          <label>Stored Home URL
+            <input id="home_url" placeholder="https://example.com" />
+          </label>
+          <label>Optional user Home URL input
+            <input id="user_home_url_input" placeholder="Leave blank to auto-search" />
+          </label>
+          <button id="processTicketBtn" class="primary">Run process_ticket</button>
+        </div>
+        <div>
+          <h2>How to pass the ticket</h2>
+          <pre id="ticketPreview"></pre>
+        </div>
+      </section>
+
+      <section class="card grid three-columns">
+        <div class="tool">
+          <h3>check_url_reachable</h3>
+          <button data-endpoint="/api/check-url" data-builder="checkUrl">Run</button>
+        </div>
+        <div class="tool">
+          <h3>get_home_url_from_user</h3>
+          <button data-endpoint="/api/get-home-url" data-builder="getHomeUrl">Run</button>
+        </div>
+        <div class="tool">
+          <h3>search_home_url</h3>
+          <button data-endpoint="/api/search-home-url" data-builder="searchHomeUrl">Run</button>
+        </div>
+        <div class="tool">
+          <h3>validate_home_url</h3>
+          <button data-endpoint="/api/validate-home-url" data-builder="validateHomeUrl">Run</button>
+        </div>
+        <div class="tool">
+          <h3>parse_account_type</h3>
+          <button data-endpoint="/api/parse-account-type" data-builder="parseAccountType">Run</button>
+        </div>
+        <div class="tool">
+          <h3>find_login_link</h3>
+          <button data-endpoint="/api/find-login-link" data-builder="findLoginLink">Run</button>
+        </div>
+        <div class="tool">
+          <h3>detect_merger</h3>
+          <button data-endpoint="/api/detect-merger" data-builder="detectMerger">Run</button>
+        </div>
+      </section>
+
+      <section class="card grid two-columns">
+        <div>
+          <h2>Request Payload</h2>
+          <pre id="requestOutput">{}</pre>
+        </div>
+        <div>
+          <h2>Response</h2>
+          <pre id="responseOutput">Run an action to see the JSON response.</pre>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
