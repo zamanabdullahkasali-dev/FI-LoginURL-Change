@@ -1,19 +1,10 @@
+import importlib
+import importlib.util
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
-
-from fi_login_url_validator import (
-    check_url_reachable,
-    detect_merger,
-    find_login_link,
-    get_home_url_from_user,
-    parse_account_type,
-    process_ticket,
-    search_home_url,
-    validate_home_url,
-)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +13,45 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 HOST = "127.0.0.1"
 PORT = 8000
+REQUIRED_PACKAGES = {
+    "requests": "requests",
+    "bs4": "beautifulsoup4",
+}
+VALIDATOR_FUNCTIONS = {}
+
+
+def ensure_dependencies_installed():
+    missing = [package_name for module_name, package_name in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module_name) is None]
+    if missing:
+        packages = " ".join(missing)
+        raise SystemExit(
+            "Missing required Python packages: "
+            f"{', '.join(missing)}.\n"
+            "Create and activate a virtual environment, then run:\n"
+            f"  python -m pip install {packages}\n"
+            "or:\n"
+            "  python -m pip install -r requirements.txt"
+        )
+
+
+def load_validator_functions():
+    global VALIDATOR_FUNCTIONS
+    if VALIDATOR_FUNCTIONS:
+        return VALIDATOR_FUNCTIONS
+
+    ensure_dependencies_installed()
+    validator_module = importlib.import_module("fi_login_url_validator")
+    VALIDATOR_FUNCTIONS = {
+        "check_url_reachable": validator_module.check_url_reachable,
+        "detect_merger": validator_module.detect_merger,
+        "find_login_link": validator_module.find_login_link,
+        "get_home_url_from_user": validator_module.get_home_url_from_user,
+        "parse_account_type": validator_module.parse_account_type,
+        "process_ticket": validator_module.process_ticket,
+        "search_home_url": validator_module.search_home_url,
+        "validate_home_url": validator_module.validate_home_url,
+    }
+    return VALIDATOR_FUNCTIONS
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -70,42 +100,43 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         try:
+            validator_functions = load_validator_functions()
             payload = self._read_json_body()
             LOGGER.info("Handling API request", extra={"path": parsed.path})
 
             if parsed.path == "/api/check-url":
-                self._send_json(check_url_reachable(payload.get("url", "")))
+                self._send_json(validator_functions["check_url_reachable"](payload.get("url", "")))
                 return
             if parsed.path == "/api/get-home-url":
                 self._send_json(
-                    get_home_url_from_user(
+                    validator_functions["get_home_url_from_user"](
                         payload.get("login_url", ""),
                         payload.get("user_input", ""),
                     )
                 )
                 return
             if parsed.path == "/api/search-home-url":
-                self._send_json(search_home_url(payload.get("login_url", "")))
+                self._send_json(validator_functions["search_home_url"](payload.get("login_url", "")))
                 return
             if parsed.path == "/api/validate-home-url":
-                self._send_json(validate_home_url(payload.get("home_url", "")))
+                self._send_json(validator_functions["validate_home_url"](payload.get("home_url", "")))
                 return
             if parsed.path == "/api/parse-account-type":
-                self._send_json(parse_account_type(payload.get("fi_name", "")))
+                self._send_json(validator_functions["parse_account_type"](payload.get("fi_name", "")))
                 return
             if parsed.path == "/api/find-login-link":
                 self._send_json(
-                    find_login_link(
+                    validator_functions["find_login_link"](
                         payload.get("home_url", ""),
                         payload.get("account_type", "Personal"),
                     )
                 )
                 return
             if parsed.path == "/api/detect-merger":
-                self._send_json(detect_merger(payload.get("fi_name", "")))
+                self._send_json(validator_functions["detect_merger"](payload.get("fi_name", "")))
                 return
             if parsed.path == "/api/process-ticket":
-                self._send_json(process_ticket(payload.get("ticket", {})))
+                self._send_json(validator_functions["process_ticket"](payload.get("ticket", {})))
                 return
 
             self._send_json({"error": "Not found"}, status=404)
@@ -117,6 +148,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def run_server(host=HOST, port=PORT):
+    load_validator_functions()
     server = HTTPServer((host, port), AppHandler)
     LOGGER.info("Starting server", extra={"host": host, "port": port})
     print(f"Server running at http://{host}:{port}")
