@@ -167,9 +167,6 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
             elif method == "Network.responseReceived":
                 response = params.get("response", {})
                 resource_type = params.get("type")
-                request_id = params.get("requestId")
-                if request_id:
-                    active_requests.discard(request_id)
                 if resource_type == "Document" and document_request is None:
                     document_request = {
                         "url": response.get("url") or driver.current_url,
