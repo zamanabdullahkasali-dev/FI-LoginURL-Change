@@ -108,9 +108,12 @@ def _build_browser_driver():
     selenium_components = _load_selenium_components()
     options = selenium_components["chrome_options"]()
     options.add_argument("--headless=new")
+    options.add_argument("--disable-http2")
+    options.add_argument("--disable-quic")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--ignore-certificate-errors")
     options.add_argument("--window-size=1440,900")
     options.set_capability("goog:loggingPrefs", {"browser": "ALL", "performance": "ALL"})
 
@@ -127,6 +130,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
     start_time = time.time()
     logs_seen = []
     document_response_count = 0
+    loading_failed_errors = []
 
     while time.time() - start_time < max_wait_seconds:
         performance_logs = driver.get_log("performance")
@@ -156,6 +160,9 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                 request_id = params.get("requestId")
                 if request_id:
                     active_requests.discard(request_id)
+                error_text = params.get("errorText")
+                if error_text:
+                    loading_failed_errors.append(error_text)
 
             elif method == "Network.responseReceived":
                 response = params.get("response", {})
@@ -187,7 +194,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
 
         time.sleep(0.25)
 
-    return document_request, logs_seen, document_response_count
+    return document_request, logs_seen, document_response_count, loading_failed_errors
 
 
 def check_url_reachable(url):
@@ -218,13 +225,28 @@ def check_url_reachable(url):
             web_driver_wait(driver, BROWSER_LOAD_WAIT_SECONDS).until(
                 lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
             )
-            document_request, performance_logs, document_response_count = _wait_for_network_idle_and_get_document_status(driver, BROWSER_LOAD_WAIT_SECONDS)
+            document_request, performance_logs, document_response_count, loading_failed_errors = _wait_for_network_idle_and_get_document_status(driver, BROWSER_LOAD_WAIT_SECONDS)
             current_url = driver.current_url or normalized_url
 
             LOGGER.info(
                 "Network logs scanned",
-                extra={"url": normalized_url, "attempt": attempt, "total_network_events_found": len(performance_logs), "document_responses_found": document_response_count},
+                extra={
+                    "url": normalized_url,
+                    "attempt": attempt,
+                    "total_network_events_found": len(performance_logs),
+                    "document_responses_found": document_response_count,
+                    "loading_failed_errors": loading_failed_errors,
+                },
             )
+
+            if "net::ERR_HTTP2_PROTOCOL_ERROR" in loading_failed_errors and document_request is None:
+                LOGGER.info(
+                    "HTTP/1.1 fallback retry triggered",
+                    extra={"url": normalized_url, "attempt": attempt, "error": "net::ERR_HTTP2_PROTOCOL_ERROR"},
+                )
+                last_error = "Retrying after HTTP/1.1 fallback"
+                last_error_code = "net::ERR_HTTP2_PROTOCOL_ERROR"
+                continue
 
             if document_request:
                 LOGGER.info(
