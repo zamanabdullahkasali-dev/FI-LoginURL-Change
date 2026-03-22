@@ -126,6 +126,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
     network_idle_started_at = None
     start_time = time.time()
     logs_seen = []
+    document_response_count = 0
 
     while time.time() - start_time < max_wait_seconds:
         performance_logs = driver.get_log("performance")
@@ -155,38 +156,38 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                 request_id = params.get("requestId")
                 if request_id:
                     active_requests.discard(request_id)
-                if params.get("type") == "Document" and document_request is None:
-                    document_request = {
-                        "url": params.get("documentURL") or driver.current_url,
-                        "status_code": None,
-                        "status_text": params.get("errorText", "Something went wrong"),
-                        "type": "Document",
-                        "error_text": params.get("errorText"),
-                    }
 
             elif method == "Network.responseReceived":
                 response = params.get("response", {})
                 resource_type = params.get("type")
-                if resource_type == "Document" and document_request is None:
-                    document_request = {
-                        "url": response.get("url") or driver.current_url,
-                        "status_code": response.get("status"),
-                        "status_text": response.get("statusText", ""),
-                        "type": resource_type,
-                    }
+                if resource_type == "Document":
+                    document_response_count += 1
+                    if document_request is None:
+                        document_request = {
+                            "url": response.get("url") or driver.current_url,
+                            "status_code": response.get("status"),
+                            "status_text": response.get("statusText", ""),
+                            "type": resource_type,
+                        }
 
+        ready_state = driver.execute_script("return document.readyState")
         if not active_requests:
             if network_idle_started_at is None:
                 network_idle_started_at = time.time()
             elif time.time() - network_idle_started_at >= 2:
                 LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "no_active_requests_for_2_seconds"})
-                break
+                if document_request is not None:
+                    break
         else:
             network_idle_started_at = None
 
+        if ready_state == "complete" and document_request is not None:
+            LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "document_ready_complete"})
+            break
+
         time.sleep(0.25)
 
-    return document_request, logs_seen
+    return document_request, logs_seen, document_response_count
 
 
 def check_url_reachable(url):
@@ -217,8 +218,13 @@ def check_url_reachable(url):
             web_driver_wait(driver, BROWSER_LOAD_WAIT_SECONDS).until(
                 lambda browser: browser.execute_script("return document.readyState") in {"interactive", "complete"}
             )
-            document_request, performance_logs = _wait_for_network_idle_and_get_document_status(driver, BROWSER_LOAD_WAIT_SECONDS)
+            document_request, performance_logs, document_response_count = _wait_for_network_idle_and_get_document_status(driver, BROWSER_LOAD_WAIT_SECONDS)
             current_url = driver.current_url or normalized_url
+
+            LOGGER.info(
+                "Network logs scanned",
+                extra={"url": normalized_url, "attempt": attempt, "total_network_events_found": len(performance_logs), "document_responses_found": document_response_count},
+            )
 
             if document_request:
                 LOGGER.info(
@@ -245,7 +251,7 @@ def check_url_reachable(url):
                 }
             )
 
-            LOGGER.info("HTTP status code detected", extra={"url": normalized_url, "attempt": attempt, "status_code": last_status})
+            LOGGER.info("Extracted status code", extra={"url": normalized_url, "attempt": attempt, "status_code": last_status})
             if last_status == 200:
                 LOGGER.info("Final decision", extra={"url": normalized_url, "attempt": attempt, "reachable": True, "status_code": last_status})
                 return {
