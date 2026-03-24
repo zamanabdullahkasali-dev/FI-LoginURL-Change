@@ -14,7 +14,8 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 10
 RETRY_COUNT = 3
 RETRY_WAIT_SECONDS = 5
-BROWSER_LOAD_WAIT_SECONDS = 15
+BROWSER_LOAD_WAIT_SECONDS = 30
+NETWORK_IDLE_SECONDS = 3
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -120,14 +121,15 @@ def _build_browser_driver():
     service = selenium_components["chrome_service"]()
     driver = selenium_components["webdriver"].Chrome(service=service, options=options)
     driver.set_page_load_timeout(BROWSER_LOAD_WAIT_SECONDS)
+    driver.set_script_timeout(BROWSER_LOAD_WAIT_SECONDS)
     return driver, selenium_components
 
 
 def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
     active_requests = set()
     document_request = None
-    network_idle_started_at = None
     start_time = time.time()
+    last_network_activity_at = start_time
     logs_seen = []
     document_response_count = 0
     loading_failed_errors = []
@@ -137,6 +139,7 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
         logs_seen.extend(performance_logs)
 
         for entry in performance_logs:
+            last_network_activity_at = time.time()
             message_text = entry.get("message", "{}")
             try:
                 message = json.loads(message_text).get("message", {})
@@ -178,18 +181,12 @@ def _wait_for_network_idle_and_get_document_status(driver, max_wait_seconds):
                         }
 
         ready_state = driver.execute_script("return document.readyState")
-        if not active_requests:
-            if network_idle_started_at is None:
-                network_idle_started_at = time.time()
-            elif time.time() - network_idle_started_at >= 2:
-                LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "no_active_requests_for_2_seconds"})
-                if document_request is not None:
-                    break
-        else:
-            network_idle_started_at = None
-
-        if ready_state == "complete" and document_request is not None:
-            LOGGER.info("Network idle detected", extra={"url": driver.current_url, "mode": "document_ready_complete"})
+        network_idle = not active_requests and (time.time() - last_network_activity_at) >= NETWORK_IDLE_SECONDS
+        if ready_state == "complete" and network_idle and document_request is not None:
+            LOGGER.info(
+                "Network idle detected",
+                extra={"url": driver.current_url, "mode": "document_ready_complete_and_no_network_for_3_seconds"},
+            )
             break
 
         time.sleep(0.25)
